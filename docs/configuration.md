@@ -270,6 +270,28 @@ auth:
       password-hash: $2a$10$o6SXqiccI3DDP2dN4ADumuOeIHET6Q4bUMYZD6rT2Aqt6XQ3DyO.6
 ```
 
+### HTTP basic authentication
+
+Some clients, such as wallpaper engines, TVs or kiosk displays, can't fill in the login form but can
+send credentials embedded in the URL (`https://user:password@your-glance-instance/`). To support
+these, you can enable HTTP basic authentication:
+
+```yaml
+auth:
+  secret-key: # this must be set to a random value generated using the secret:make CLI command
+  allow-basic-auth: true
+  users:
+    admin:
+      password: 123456
+```
+
+The same users and passwords are used as for the login form, and failed attempts are rate limited in
+the same way. When this is enabled, unauthenticated requests are answered with a `401 Unauthorized`
+and an authentication challenge instead of being redirected to the login page, which means browsers
+will show their built-in credentials prompt rather than the Glance login page. The login page is
+still available at `/login`. Because credentials are sent with every request, you should only enable
+this if your instance is served over HTTPS.
+
 ### Preventing brute-force attacks
 
 Glance will automatically block IP addresses of users who fail to authenticate 5 times in a row in the span of 5 minutes. In order for this feature to work correctly, Glance must know the real IP address of requests. If you're using a reverse proxy such as nginx, Traefik, NPM, etc, you must set the `proxied` property in the `server` configuration to `true`:
