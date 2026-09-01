@@ -37,8 +37,9 @@ type config struct {
 	} `yaml:"server"`
 
 	Auth struct {
-		SecretKey string           `yaml:"secret-key"`
-		Users     map[string]*user `yaml:"users"`
+		SecretKey      string           `yaml:"secret-key"`
+		AllowBasicAuth bool             `yaml:"allow-basic-auth"`
+		Users          map[string]*user `yaml:"users"`
 	} `yaml:"auth"`
 
 	Document struct {

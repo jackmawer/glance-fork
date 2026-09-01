@@ -3,8 +3,13 @@ package glance
 import (
 	"bytes"
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func TestAuthTokenGenerationAndVerification(t *testing.T) {
@@ -82,4 +87,113 @@ func TestAuthTokenGenerationAndVerification(t *testing.T) {
 			t.Fatalf("Expected token verification to fail for tampered token at index %d", i)
 		}
 	}
+}
+
+func newTestAuthApplication(t *testing.T, allowBasicAuth bool) *application {
+	t.Helper()
+
+	secret, err := makeAuthSecretKey(AUTH_SECRET_KEY_LENGTH)
+	if err != nil {
+		t.Fatalf("Failed to generate secret key: %v", err)
+	}
+
+	secretBytes, err := base64.StdEncoding.DecodeString(secret)
+	if err != nil {
+		t.Fatalf("Failed to decode secret key: %v", err)
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("Failed to hash password: %v", err)
+	}
+
+	app := &application{
+		RequiresAuth:           true,
+		authSecretKey:          secretBytes,
+		usernameHashToUsername: make(map[string]string),
+		failedAuthAttempts:     make(map[string]*failedAuthAttempt),
+	}
+	app.Config.Auth.AllowBasicAuth = allowBasicAuth
+	app.Config.Auth.Users = map[string]*user{
+		"admin": {PasswordHash: passwordHash},
+	}
+
+	usernameHash, err := computeUsernameHash("admin", secretBytes)
+	if err != nil {
+		t.Fatalf("Failed to compute username hash: %v", err)
+	}
+	app.usernameHashToUsername[string(usernameHash)] = "admin"
+
+	return app
+}
+
+func TestBasicAuth(t *testing.T) {
+	t.Run("valid credentials are authorized and receive a session cookie", func(t *testing.T) {
+		app := newTestAuthApplication(t, true)
+
+		r := httptest.NewRequest("GET", "/", nil)
+		r.SetBasicAuth("admin", "password123")
+		w := httptest.NewRecorder()
+
+		if !app.isAuthorized(w, r) {
+			t.Fatal("Request with valid basic auth credentials should be authorized")
+		}
+
+		cookies := w.Result().Cookies()
+		if len(cookies) != 1 || cookies[0].Name != AUTH_SESSION_COOKIE_NAME || cookies[0].Value == "" {
+			t.Fatalf("Expected a session cookie to be set, got %v", cookies)
+		}
+	})
+
+	t.Run("invalid credentials are not authorized", func(t *testing.T) {
+		app := newTestAuthApplication(t, true)
+
+		r := httptest.NewRequest("GET", "/", nil)
+		r.SetBasicAuth("admin", "wrongpassword")
+
+		if app.isAuthorized(httptest.NewRecorder(), r) {
+			t.Fatal("Request with invalid basic auth credentials should not be authorized")
+		}
+	})
+
+	t.Run("credentials are ignored when basic auth is disabled", func(t *testing.T) {
+		app := newTestAuthApplication(t, false)
+
+		r := httptest.NewRequest("GET", "/", nil)
+		r.SetBasicAuth("admin", "password123")
+
+		if app.isAuthorized(httptest.NewRecorder(), r) {
+			t.Fatal("Basic auth credentials should be ignored when allow-basic-auth is not enabled")
+		}
+	})
+
+	t.Run("unauthorized requests are challenged when basic auth is enabled", func(t *testing.T) {
+		app := newTestAuthApplication(t, true)
+
+		w := httptest.NewRecorder()
+		app.handleUnauthorizedResponse(w, httptest.NewRequest("GET", "/", nil), redirectToLogin)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
+		}
+
+		if !strings.HasPrefix(w.Header().Get("WWW-Authenticate"), "Basic ") {
+			t.Fatalf("Expected a basic auth challenge, got %q", w.Header().Get("WWW-Authenticate"))
+		}
+	})
+
+	t.Run("unauthorized requests are redirected when basic auth is disabled", func(t *testing.T) {
+		app := newTestAuthApplication(t, false)
+
+		w := httptest.NewRecorder()
+		app.handleUnauthorizedResponse(w, httptest.NewRequest("GET", "/", nil), redirectToLogin)
+
+		if w.Code != http.StatusSeeOther {
+			t.Fatalf("Expected status %d, got %d", http.StatusSeeOther, w.Code)
+		}
+
+		if w.Header().Get("WWW-Authenticate") != "" {
+			t.Fatal("No basic auth challenge should be sent when allow-basic-auth is not enabled")
+		}
+	})
 }

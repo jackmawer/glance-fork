@@ -21,6 +21,7 @@ import (
 )
 
 const AUTH_SESSION_COOKIE_NAME = "session_token"
+const AUTH_BASIC_REALM = "Glance"
 const AUTH_RATE_LIMIT_WINDOW = 5 * time.Minute
 const AUTH_RATE_LIMIT_MAX_ATTEMPTS = 5
 
@@ -131,6 +132,94 @@ func makeAuthSecretKey(length int) (string, error) {
 	return base64.StdEncoding.EncodeToString(key), nil
 }
 
+// Records a failed authentication attempt for the given IP address and reports whether
+// it has exceeded the rate limit, along with the number of seconds until it may try again.
+func (a *application) recordAuthAttempt(ip string) (bool, int) {
+	a.authAttemptsMu.Lock()
+	defer a.authAttemptsMu.Unlock()
+
+	attempt, exists := a.failedAuthAttempts[ip]
+	if !exists {
+		a.failedAuthAttempts[ip] = &failedAuthAttempt{
+			attempts: 1,
+			first:    time.Now(),
+		}
+
+		return false, 0
+	}
+
+	elapsed := time.Since(attempt.first)
+	if elapsed < AUTH_RATE_LIMIT_WINDOW && attempt.attempts >= AUTH_RATE_LIMIT_MAX_ATTEMPTS {
+		return true, max(1, int(AUTH_RATE_LIMIT_WINDOW.Seconds()-elapsed.Seconds()))
+	}
+
+	attempt.attempts++
+
+	// Clean up old failed attempts
+	for ipOfAttempt := range a.failedAuthAttempts {
+		if time.Since(a.failedAuthAttempts[ipOfAttempt].first) > AUTH_RATE_LIMIT_WINDOW {
+			delete(a.failedAuthAttempts, ipOfAttempt)
+		}
+	}
+
+	return false, 0
+}
+
+func (a *application) clearAuthAttempts(ip string) {
+	a.authAttemptsMu.Lock()
+	delete(a.failedAuthAttempts, ip)
+	a.authAttemptsMu.Unlock()
+}
+
+func (a *application) credentialsAreValid(username, password string) bool {
+	if len(username) == 0 || len(password) == 0 {
+		return false
+	}
+
+	if len(username) > 50 || len(password) > 100 {
+		return false
+	}
+
+	u, exists := a.Config.Auth.Users[username]
+	if !exists {
+		return false
+	}
+
+	return bcrypt.CompareHashAndPassword(u.PasswordHash, []byte(password)) == nil
+}
+
+// Attempts to authenticate the request using the HTTP Basic authentication scheme. On success
+// a session cookie is also set so that subsequent requests don't have to re-verify the password.
+func (a *application) authorizeViaBasicAuth(w http.ResponseWriter, r *http.Request) bool {
+	username, password, ok := r.BasicAuth()
+	if !ok {
+		return false
+	}
+
+	ip := a.addressOfRequest(r)
+
+	if exceededRateLimit, _ := a.recordAuthAttempt(ip); exceededRateLimit {
+		time.Sleep(1 * time.Second)
+		return false
+	}
+
+	if !a.credentialsAreValid(username, password) {
+		log.Printf("Failed basic auth attempt for user '%s' from %s", username, ip)
+		time.Sleep(1 * time.Second)
+		return false
+	}
+
+	a.clearAuthAttempts(ip)
+
+	if token, err := generateSessionToken(username, a.authSecretKey, time.Now()); err == nil {
+		a.setAuthSessionCookie(w, r, token, time.Now().Add(AUTH_TOKEN_VALID_PERIOD))
+	} else {
+		log.Printf("Could not compute session token during basic auth: %v", err)
+	}
+
+	return true
+}
+
 func (a *application) handleAuthenticationAttempt(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get("Content-Type") != "application/json" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -141,41 +230,11 @@ func (a *application) handleAuthenticationAttempt(w http.ResponseWriter, r *http
 
 	ip := a.addressOfRequest(r)
 
-	a.authAttemptsMu.Lock()
-	exceededRateLimit, retryAfter := func() (bool, int) {
-		attempt, exists := a.failedAuthAttempts[ip]
-		if !exists {
-			a.failedAuthAttempts[ip] = &failedAuthAttempt{
-				attempts: 1,
-				first:    time.Now(),
-			}
-
-			return false, 0
-		}
-
-		elapsed := time.Since(attempt.first)
-		if elapsed < AUTH_RATE_LIMIT_WINDOW && attempt.attempts >= AUTH_RATE_LIMIT_MAX_ATTEMPTS {
-			return true, max(1, int(AUTH_RATE_LIMIT_WINDOW.Seconds()-elapsed.Seconds()))
-		}
-
-		attempt.attempts++
-		return false, 0
-	}()
-
-	if exceededRateLimit {
-		a.authAttemptsMu.Unlock()
+	if exceededRateLimit, retryAfter := a.recordAuthAttempt(ip); exceededRateLimit {
 		time.Sleep(waitOnFailure)
 		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		w.WriteHeader(http.StatusTooManyRequests)
 		return
-	} else {
-		// Clean up old failed attempts
-		for ipOfAttempt := range a.failedAuthAttempts {
-			if time.Since(a.failedAuthAttempts[ipOfAttempt].first) > AUTH_RATE_LIMIT_WINDOW {
-				delete(a.failedAuthAttempts, ipOfAttempt)
-			}
-		}
-		a.authAttemptsMu.Unlock()
 	}
 
 	body, err := io.ReadAll(r.Body)
@@ -208,22 +267,7 @@ func (a *application) handleAuthenticationAttempt(w http.ResponseWriter, r *http
 		return
 	}
 
-	if len(creds.Username) > 50 || len(creds.Password) > 100 {
-		logAuthFailure()
-		time.Sleep(waitOnFailure)
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	u, exists := a.Config.Auth.Users[creds.Username]
-	if !exists {
-		logAuthFailure()
-		time.Sleep(waitOnFailure)
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
-
-	if err := bcrypt.CompareHashAndPassword(u.PasswordHash, []byte(creds.Password)); err != nil {
+	if !a.credentialsAreValid(creds.Username, creds.Password) {
 		logAuthFailure()
 		time.Sleep(waitOnFailure)
 		w.WriteHeader(http.StatusUnauthorized)
@@ -239,10 +283,7 @@ func (a *application) handleAuthenticationAttempt(w http.ResponseWriter, r *http
 	}
 
 	a.setAuthSessionCookie(w, r, token, time.Now().Add(AUTH_TOKEN_VALID_PERIOD))
-
-	a.authAttemptsMu.Lock()
-	delete(a.failedAuthAttempts, ip)
-	a.authAttemptsMu.Unlock()
+	a.clearAuthAttempts(ip)
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -254,12 +295,12 @@ func (a *application) isAuthorized(w http.ResponseWriter, r *http.Request) bool 
 
 	token, err := r.Cookie(AUTH_SESSION_COOKIE_NAME)
 	if err != nil || token.Value == "" {
-		return false
+		return a.Config.Auth.AllowBasicAuth && a.authorizeViaBasicAuth(w, r)
 	}
 
 	usernameHash, shouldRegenerate, err := verifySessionToken(token.Value, a.authSecretKey, time.Now())
 	if err != nil {
-		return false
+		return a.Config.Auth.AllowBasicAuth && a.authorizeViaBasicAuth(w, r)
 	}
 
 	username, exists := a.usernameHashToUsername[string(usernameHash)]
@@ -291,8 +332,19 @@ func (a *application) handleUnauthorizedResponse(w http.ResponseWriter, r *http.
 		return false
 	}
 
+	if a.Config.Auth.AllowBasicAuth {
+		// Clients such as non-interactive browsers only send basic auth credentials after
+		// they've been challenged, so a challenge must be sent rather than a redirect.
+		w.Header().Set("WWW-Authenticate", `Basic realm="`+AUTH_BASIC_REALM+`", charset="UTF-8"`)
+	}
+
 	switch fallback {
 	case redirectToLogin:
+		if a.Config.Auth.AllowBasicAuth {
+			w.WriteHeader(http.StatusUnauthorized)
+			break
+		}
+
 		http.Redirect(w, r, a.Config.Server.BaseURL+"/login", http.StatusSeeOther)
 	case showUnauthorizedJSON:
 		w.WriteHeader(http.StatusUnauthorized)
