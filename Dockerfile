@@ -1,8 +1,13 @@
-FROM golang:1.27.0-alpine3.24 AS builder
+# Build on the native platform and cross-compile for the target one, rather than
+# running the whole toolchain under emulation for each platform being published.
+FROM --platform=$BUILDPLATFORM golang:1.27.0-alpine3.24 AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /app
 COPY . /app
-RUN CGO_ENABLED=0 go build .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build .
 
 FROM alpine:3.24
 
