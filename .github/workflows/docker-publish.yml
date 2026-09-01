@@ -59,6 +59,7 @@ jobs:
         id: push
         uses: docker/build-push-action@8c1e8f8e5bf845ba3773a14f3967965548a2341e
         with:
+          platforms: linux/amd64,linux/arm64
           context: ./
           file: ./Dockerfile
           push: true
