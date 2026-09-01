@@ -1,15 +1,18 @@
 name: Tests
 
 on:
-  push:
-    branches: ['main']
   pull_request:
   workflow_dispatch:
   # Allows this workflow to be reused as a gate by other workflows
   workflow_call:
 
+# The group must not be `github.workflow`-based: when this workflow is reused via
+# `workflow_call`, `github.workflow` is the *calling* workflow's name, so the group
+# would be identical to the caller's and the call would deadlock waiting on itself.
+# Pushes to main are covered by the publish workflow, which calls this one, so there
+# is no direct push trigger here to collide with that call either.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: tests-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
